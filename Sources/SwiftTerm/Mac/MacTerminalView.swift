@@ -4742,8 +4742,8 @@ extension TerminalViewDelegate {
 
 /// NSTextView subclass used for the dictation / IME marked-text overlay.
 ///
-/// Fills its background only under the laid-out line fragments rather than
-/// across the full frame. Line 1 already has an exclusion path covering the
+/// Fills its background only under the laid-out text of each line fragment
+/// rather than across the full frame. Line 1 already has an exclusion path covering the
 /// portion occupied by pre-existing terminal text (e.g. the prompt), so this
 /// drawing strategy leaves that area untouched while still covering wrapped
 /// lines below.
@@ -4758,16 +4758,27 @@ final class DictationOverlayTextView: NSTextView {
     }
 
     private func drawPerFragmentBackground(in dirtyRect: NSRect) {
-        guard let layoutManager, let container = textContainer else { return }
         overlayBackgroundColor.setFill()
+        for r in backgroundRects() where r.intersects(dirtyRect) {
+            r.fill()
+        }
+    }
+
+    /// The areas painted behind the marked text, in view coordinates.
+    ///
+    /// Uses each fragment's used rect. The fragment rect spans the full
+    /// container width, which is the whole terminal width, so painting it
+    /// hid the terminal contents to the right of the caret up to the end of
+    /// the row, even for a single composed character.
+    func backgroundRects() -> [NSRect] {
+        guard let layoutManager, let container = textContainer else { return [] }
         let glyphRange = layoutManager.glyphRange(for: container)
         let origin = textContainerOrigin
-        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { fragmentRect, _, _, _, _ in
-            let r = fragmentRect.offsetBy(dx: origin.x, dy: origin.y)
-            if r.intersects(dirtyRect) {
-                r.fill()
-            }
+        var rects: [NSRect] = []
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, _, _ in
+            rects.append(usedRect.offsetBy(dx: origin.x, dy: origin.y))
         }
+        return rects
     }
 }
 #endif
