@@ -4751,8 +4751,10 @@ final class DictationOverlayTextView: NSTextView {
         overlayBackgroundColor.setFill()
         let glyphRange = layoutManager.glyphRange(for: container)
         let origin = textContainerOrigin
-        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { fragmentRect, _, _, _, _ in
-            let r = fragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+        // 글자가 실제로 차지한 영역(usedRect)만 칠한다. 줄 조각 전체(fragmentRect)는 컨테이너
+        // 폭 끝까지라, 조합 중 글자 한 자에도 커서 오른쪽의 터미널 내용이 줄 끝까지 가려진다.
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, _, _ in
+            let r = usedRect.offsetBy(dx: origin.x, dy: origin.y)
             if r.intersects(dirtyRect) {
                 r.fill()
             }
