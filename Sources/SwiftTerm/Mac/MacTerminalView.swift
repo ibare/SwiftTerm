@@ -3414,7 +3414,85 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         let flags = event.modifierFlags
         let isReleaseEvent = overwriteRelease || [NSEvent.EventType.leftMouseUp, .otherMouseUp, .rightMouseUp].contains(event.type)
         
-        return terminal.encodeButton(button: event.buttonNumber, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+        return terminal.encodeButton(button: Self.protocolButton(for: event.buttonNumber), release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+    }
+
+    /// AppKit 의 버튼 번호는 0 = 왼쪽, 1 = 오른쪽, 2 = 가운데다. xterm 마우스 규약은
+    /// 0 = 왼쪽, 1 = 가운데, 2 = 오른쪽이라 그대로 넘기면 오른쪽이 가운데로 보고된다.
+    static func protocolButton(for buttonNumber: Int) -> Int {
+        switch buttonNumber {
+        case 1: return 2
+        case 2: return 1
+        default: return buttonNumber
+        }
+    }
+
+    // 오른쪽·가운데 버튼. 재정의가 없으면 AppKit 이 이벤트를 응답자 사슬 위로 넘겨 버려서,
+    // 마우스 보고를 켠 프로그램(tmux, vim, htop)이 받지 못한다 — tmux 의 오른쪽 클릭 메뉴가
+    // 뜨지 않는 원인. 보고가 꺼져 있거나 Shift 로 우회하면 AppKit 기본 동작을 그대로 둔다.
+
+    private func reportsExtraButton(_ event: NSEvent, press: Bool) -> Bool {
+        withTerminal { terminal in
+            allowMouseReporting && !shiftBypassesMouseReportingLocked(for: event)
+                && (press ? terminal.mouseMode.sendButtonPress() : terminal.mouseMode.sendButtonRelease())
+        }
+    }
+
+    /// 오른쪽·가운데 버튼을 누른 채 끄는 동작을 보고한다. 터미널이 이 동작을 가져가면 true.
+    private func reportExtraButtonDrag(_ event: NSEvent) -> Bool {
+        withTerminal { terminal in
+            guard allowMouseReporting, !shiftBypassesMouseReportingLocked(for: event) else { return false }
+            guard terminal.mouseMode.sendButtonTracking() else { return terminal.mouseMode != .off }
+            let displayBuffer = terminal.displayBuffer
+            let mouseHit = calculateMouseHitLocked(at: convert(event.locationInWindow, from: nil))
+            let flags = encodeMouseEventLocked(with: event)
+            let screenRow = max(0, min(displayBuffer.rows - 1, mouseHit.grid.row - displayBuffer.yDisp))
+            terminal.sendMotion(buttonFlags: flags, x: mouseHit.grid.col, y: screenRow,
+                                pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
+            return true
+        }
+    }
+
+    open override func rightMouseDown(with event: NSEvent) {
+        if reportsExtraButton(event, press: true) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    open override func rightMouseUp(with event: NSEvent) {
+        if reportsExtraButton(event, press: false) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseUp(with: event)
+    }
+
+    open override func rightMouseDragged(with event: NSEvent) {
+        if reportExtraButtonDrag(event) { return }
+        super.rightMouseDragged(with: event)
+    }
+
+    open override func otherMouseDown(with event: NSEvent) {
+        if reportsExtraButton(event, press: true) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.otherMouseDown(with: event)
+    }
+
+    open override func otherMouseUp(with event: NSEvent) {
+        if reportsExtraButton(event, press: false) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.otherMouseUp(with: event)
+    }
+
+    open override func otherMouseDragged(with event: NSEvent) {
+        if reportExtraButtonDrag(event) { return }
+        super.otherMouseDragged(with: event)
     }
     
     func calculateMouseHit (with event: NSEvent) -> (grid: Position, pixels: Position)
