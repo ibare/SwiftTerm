@@ -3414,7 +3414,96 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         let flags = event.modifierFlags
         let isReleaseEvent = overwriteRelease || [NSEvent.EventType.leftMouseUp, .otherMouseUp, .rightMouseUp].contains(event.type)
         
-        return terminal.encodeButton(button: event.buttonNumber, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+        return terminal.encodeButton(button: Self.terminalButton(forAppKitButton: event.buttonNumber), release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+    }
+
+    /// Maps an AppKit button number to the button number used by the mouse
+    /// reporting protocols.
+    ///
+    /// AppKit numbers the buttons left 0, right 1, middle 2. The xterm
+    /// protocols number them left 0, middle 1, right 2.
+    static func terminalButton(forAppKitButton buttonNumber: Int) -> Int {
+        switch buttonNumber {
+        case 1: return 2
+        case 2: return 1
+        default: return buttonNumber
+        }
+    }
+
+    // MARK: Right and middle buttons
+    //
+    // Without these overrides AppKit sends the events up the responder chain,
+    // so an application that enabled mouse reporting (tmux, vim, htop) never
+    // receives them. When reporting is off, or Shift bypasses it, the events
+    // keep their default AppKit behavior.
+
+    private func reportsAuxiliaryButton(_ event: NSEvent, press: Bool) -> Bool {
+        withTerminal { terminal in
+            allowMouseReporting && !shiftBypassesMouseReportingLocked(for: event)
+                && (press ? terminal.mouseMode.sendButtonPress() : terminal.mouseMode.sendButtonRelease())
+        }
+    }
+
+    /// Reports a drag with the right or middle button held. Returns `true`
+    /// when the terminal consumed the event.
+    private func reportAuxiliaryButtonDrag(_ event: NSEvent) -> Bool {
+        withTerminal { terminal in
+            guard allowMouseReporting, !shiftBypassesMouseReportingLocked(for: event) else { return false }
+            guard terminal.mouseMode.sendButtonTracking() else { return terminal.mouseMode != .off }
+            let displayBuffer = terminal.displayBuffer
+            let mouseHit = calculateMouseHitLocked(at: convert(event.locationInWindow, from: nil))
+            let flags = encodeMouseEventLocked(with: event)
+            let screenRow = max(0, min(displayBuffer.rows - 1, mouseHit.grid.row - displayBuffer.yDisp))
+            terminal.sendMotion(buttonFlags: flags, x: mouseHit.grid.col, y: screenRow,
+                                pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
+            return true
+        }
+    }
+
+    open override func rightMouseDown(with event: NSEvent) {
+        if reportsAuxiliaryButton(event, press: true) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    open override func rightMouseUp(with event: NSEvent) {
+        if reportsAuxiliaryButton(event, press: false) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseUp(with: event)
+    }
+
+    open override func rightMouseDragged(with event: NSEvent) {
+        if reportAuxiliaryButtonDrag(event) {
+            return
+        }
+        super.rightMouseDragged(with: event)
+    }
+
+    open override func otherMouseDown(with event: NSEvent) {
+        if reportsAuxiliaryButton(event, press: true) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.otherMouseDown(with: event)
+    }
+
+    open override func otherMouseUp(with event: NSEvent) {
+        if reportsAuxiliaryButton(event, press: false) {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.otherMouseUp(with: event)
+    }
+
+    open override func otherMouseDragged(with event: NSEvent) {
+        if reportAuxiliaryButtonDrag(event) {
+            return
+        }
+        super.otherMouseDragged(with: event)
     }
     
     func calculateMouseHit (with event: NSEvent) -> (grid: Position, pixels: Position)

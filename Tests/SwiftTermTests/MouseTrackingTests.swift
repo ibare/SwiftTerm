@@ -574,6 +574,85 @@ struct MouseTrackingTests {
         #expect(sent.first?.hasSuffix("m") == true)
     }
 
+    @MainActor private func auxiliaryClick(_ down: NSEvent.EventType, _ up: NSEvent.EventType,
+                                            buttonNumber: Int,
+                                            modifierFlags: NSEvent.ModifierFlags = [],
+                                            enableReporting: Bool = true,
+                                            expectsReports: Bool = true) async -> [String] {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        let window = NSWindow(contentRect: view.frame, styleMask: .borderless,
+                              backing: .buffered, defer: false)
+        window.contentView = view
+        let delegate = MouseMotionCapturingDelegate()
+        view.terminalDelegate = delegate
+        if enableReporting {
+            view.feed(text: "\(esc)[?1000h\(esc)[?1006h")
+        }
+        let point = CGPoint(x: 1.5 * view.cellDimension.width,
+                            y: view.frame.height - 0.5 * view.cellDimension.height)
+        func event(_ type: NSEvent.EventType, _ number: Int) -> NSEvent {
+            let cg = NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifierFlags,
+                                        timestamp: 0, windowNumber: window.windowNumber,
+                                        context: nil, eventNumber: number, clickCount: 1,
+                                        pressure: 1)!.cgEvent!
+            cg.setIntegerValueField(.mouseEventButtonNumber, value: Int64(buttonNumber))
+            return NSEvent(cgEvent: cg)!
+        }
+        let pressEvent = event(down, 1)
+        let releaseEvent = event(up, 2)
+        switch down {
+        case .rightMouseDown:
+            view.rightMouseDown(with: pressEvent)
+            view.rightMouseUp(with: releaseEvent)
+        default:
+            view.otherMouseDown(with: pressEvent)
+            view.otherMouseUp(with: releaseEvent)
+        }
+        if expectsReports {
+            await waitForSentData(from: delegate)
+        } else {
+            await waitForTerminalViewCallbacks()
+        }
+        return delegate.sentData.map { String(bytes: $0, encoding: .utf8) ?? "" }
+    }
+
+    @Test @MainActor func rightButtonReportsXtermButtonTwo() async {
+        let sent = await auxiliaryClick(.rightMouseDown, .rightMouseUp, buttonNumber: 1)
+        #expect(sent.count == 2)
+        #expect(sent.first?.hasPrefix("\(esc)[<2;") == true)
+        #expect(sent.first?.hasSuffix("M") == true)
+        #expect(sent.last?.hasPrefix("\(esc)[<2;") == true)
+        #expect(sent.last?.hasSuffix("m") == true)
+    }
+
+    @Test @MainActor func middleButtonReportsXtermButtonOne() async {
+        let sent = await auxiliaryClick(.otherMouseDown, .otherMouseUp, buttonNumber: 2)
+        #expect(sent.count == 2)
+        #expect(sent.first?.hasPrefix("\(esc)[<1;") == true)
+        #expect(sent.first?.hasSuffix("M") == true)
+        #expect(sent.last?.hasPrefix("\(esc)[<1;") == true)
+        #expect(sent.last?.hasSuffix("m") == true)
+    }
+
+    @Test @MainActor func rightButtonIsNotReportedWithoutMouseReporting() async {
+        let sent = await auxiliaryClick(.rightMouseDown, .rightMouseUp, buttonNumber: 1,
+                                        enableReporting: false, expectsReports: false)
+        #expect(sent.isEmpty)
+    }
+
+    @Test @MainActor func shiftBypassesRightButtonReporting() async {
+        let sent = await auxiliaryClick(.rightMouseDown, .rightMouseUp, buttonNumber: 1,
+                                        modifierFlags: .shift, expectsReports: false)
+        #expect(sent.isEmpty)
+    }
+
+    @Test func appKitButtonNumbersMapToXtermButtons() {
+        #expect(TerminalView.terminalButton(forAppKitButton: 0) == 0)
+        #expect(TerminalView.terminalButton(forAppKitButton: 1) == 2)
+        #expect(TerminalView.terminalButton(forAppKitButton: 2) == 1)
+        #expect(TerminalView.terminalButton(forAppKitButton: 3) == 3)
+    }
+
     @Test @MainActor func shiftBypassedPressStillReportsUnshiftedRelease() async {
         let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
         view.semanticClickCoalescingDelay = 0.01
