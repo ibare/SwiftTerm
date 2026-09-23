@@ -4358,6 +4358,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
+    /// 벨(BEL)이 울릴 때 메인에서 불린다. bellStyle 과 무관하게 부른다 — 소리를 끈 호스트도
+    /// "벨이 울렸다" 는 사실은 알아야 한다(예: 가려진 세션에 주의 표시).
+    public var onBell: (() -> Void)?
+
+    /// OSC 9 / OSC 777 데스크톱 알림을 받으면 메인에서 불린다. 지금까지는 받은 알림을 버렸다.
+    public var onNotification: ((_ title: String, _ body: String) -> Void)?
+
     /// Gate consulted when a queued bell is delivered on the main thread.
     let bellPolicy = BellPolicy()
 
@@ -4400,6 +4407,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
 
     private func deliverBell () {
+        onBell?()
         guard bellPolicy.shouldDeliver() else { return }
         switch bellStyle {
         case .none:

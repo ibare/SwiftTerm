@@ -2404,9 +2404,14 @@ extension TerminalView {
     {
         let capturedTitle = title
         let capturedBody = body
-        onMain {
+        onMain { [weak self] in
+#if os(macOS)
+            self?.onNotification?(capturedTitle, capturedBody)
+#else
+            let _ = self
             let _ = capturedTitle
             let _ = capturedBody
+#endif
         }
     }
     
