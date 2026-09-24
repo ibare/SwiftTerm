@@ -8896,7 +8896,7 @@ open class Terminal {
     }
 
     struct LinkMatch: Sendable {
-        struct RowRange: Equatable, Sendable {
+        struct RowRange: Hashable, Sendable {
             let row: Int
             let range: Range<Int>
         }
@@ -9084,11 +9084,15 @@ open class Terminal {
         let matches = regex.matches(in: lineMap.text, options: [], range: searchRange)
         for match in matches {
             guard match.range.length > 0,
-                  let textRange = Range(match.range, in: lineMap.text)
+                  let rawRange = Range(match.range, in: lineMap.text)
             else {
                 continue
             }
-            if suppressGhosttyLikeMatch(textRange, in: lineMap.text) {
+            if suppressGhosttyLikeMatch(rawRange, in: lineMap.text) {
+                continue
+            }
+            let textRange = trimmingAttachedTrailingNonASCII(rawRange, in: lineMap.text)
+            guard !textRange.isEmpty else {
                 continue
             }
 
@@ -9282,7 +9286,11 @@ open class Terminal {
         charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&*+,;=%()"
     )
 
-    private func buildGhosttyImplicitLineMap(at position: Position, in buffer: Buffer) -> GhosttyImplicitLineMap?
+    /// - Parameter requireTarget: when true (the lookup path), returns nil unless `position`
+    ///   falls on trimmed content. Row scans pass false so a row whose first column is
+    ///   blank still yields its line group.
+    private func buildGhosttyImplicitLineMap(at position: Position, in buffer: Buffer,
+                                             requireTarget: Bool = true) -> GhosttyImplicitLineMap?
     {
         guard position.row >= 0 && position.row < buffer.lines.count else {
             return nil
@@ -9361,7 +9369,7 @@ open class Terminal {
             }
         }
 
-        guard !text.isEmpty, !cells.isEmpty, targetIsInsideTrimmedContent else {
+        guard !text.isEmpty, !cells.isEmpty, targetIsInsideTrimmedContent || !requireTarget else {
             return nil
         }
 
@@ -9605,6 +9613,91 @@ open class Terminal {
             col += 1
         }
         return lineLimit
+    }
+
+    /// Drops a run of non-ASCII characters glued to the end of a match when the character
+    /// before the run is an ASCII letter or digit.
+    ///
+    /// `\w` in the path pattern is Unicode-aware, so in languages that attach particles to
+    /// the preceding word (Korean `docs/a.md에`, `a.ts가`) the particle becomes part of the
+    /// link. A non-ASCII run that follows `/` or another non-ASCII character is kept, so
+    /// paths with non-ASCII names (`문서/노트`, `문서/노트.md`) still match whole.
+    func trimmingAttachedTrailingNonASCII(_ range: Range<String.Index>, in text: String) -> Range<String.Index>
+    {
+        var runStart = range.upperBound
+        while runStart > range.lowerBound {
+            let previous = text.index(before: runStart)
+            if text[previous].isASCII {
+                break
+            }
+            runStart = previous
+        }
+        guard runStart < range.upperBound, runStart > range.lowerBound else {
+            return range
+        }
+        let beforeRun = text[text.index(before: runStart)]
+        guard beforeRun.isASCII, beforeRun.isLetter || beforeRun.isNumber else {
+            return range
+        }
+        return range.lowerBound..<runStart
+    }
+
+    /// Cell ranges of every implicit (regex-detected) link that touches `rows`, in buffer
+    /// coordinates. Used to reveal all links at once; lookups under the pointer use
+    /// ``linkMatch(at:mode:)``. Each wrapped line group is scanned once.
+    func implicitLinkRanges(inRows rows: Range<Int>) -> [LinkMatch.RowRange]
+    {
+        let buffer = displayBuffer
+        guard let regex = Self.ghosttyImplicitLinkRegex else {
+            return []
+        }
+        let lower = max(0, rows.lowerBound)
+        let upper = min(rows.upperBound, buffer.lines.count)
+        var result: [LinkMatch.RowRange] = []
+        var seen = Set<LinkMatch.RowRange>()
+        var row = lower
+        while row < upper {
+            guard let lineMap = buildGhosttyImplicitLineMap(at: Position(col: 0, row: row), in: buffer,
+                                                            requireTarget: false) else {
+                row += 1
+                continue
+            }
+            let searchRange = NSRange(lineMap.text.startIndex..<lineMap.text.endIndex, in: lineMap.text)
+            for match in regex.matches(in: lineMap.text, options: [], range: searchRange) {
+                guard match.range.length > 0,
+                      let rawRange = Range(match.range, in: lineMap.text),
+                      !suppressGhosttyLikeMatch(rawRange, in: lineMap.text)
+                else {
+                    continue
+                }
+                let textRange = trimmingAttachedTrailingNonASCII(rawRange, in: lineMap.text)
+                let startOffset = lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.lowerBound)
+                let endOffset = min(lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.upperBound),
+                                    lineMap.cells.count)
+                guard startOffset < endOffset else {
+                    continue
+                }
+                var bounds: [Int: (start: Int, end: Int)] = [:]
+                for index in startOffset..<endOffset {
+                    let cell = lineMap.cells[index]
+                    let cellEnd = cell.col + max(1, cell.width)
+                    if let existing = bounds[cell.row] {
+                        bounds[cell.row] = (min(existing.start, cell.col), max(existing.end, cellEnd))
+                    } else {
+                        bounds[cell.row] = (cell.col, cellEnd)
+                    }
+                }
+                for (boundRow, bound) in bounds where boundRow >= lower && boundRow < upper && bound.start < bound.end {
+                    let range = LinkMatch.RowRange(row: boundRow, range: bound.start..<bound.end)
+                    if seen.insert(range).inserted {
+                        result.append(range)
+                    }
+                }
+            }
+            let lastRow = lineMap.cells.last?.row ?? row
+            row = max(row + 1, lastRow + 1)
+        }
+        return result
     }
 
     private func suppressGhosttyLikeMatch(_ range: Range<String.Index>, in text: String) -> Bool
