@@ -493,6 +493,35 @@ struct SnapshotSelectionResolver {
     }
 }
 
+/// ``LinkRevealStyle`` (macOS) captured for one frame.
+struct LinkRevealColors: Sendable, Hashable {
+    let background: FrameColor
+    let foreground: FrameColor
+}
+
+/// Links revealed in one frame: the colors and the visible cell ranges to paint.
+struct SnapshotLinkReveal: Equatable {
+    let colors: LinkRevealColors
+    let ranges: [Terminal.LinkMatch.RowRange]
+}
+
+/// Per-row lookup of the revealed ranges, built once per render context.
+struct SnapshotLinkRevealResolver {
+    let background: TTColor
+    let foreground: TTColor
+    private let rows: [Int: [Range<Int>]]
+
+    init(_ reveal: SnapshotLinkReveal) {
+        background = reveal.colors.background.nativeColor
+        foreground = reveal.colors.foreground.nativeColor
+        rows = Dictionary(grouping: reveal.ranges, by: \.row).mapValues { $0.map(\.range) }
+    }
+
+    func columns(forRow row: Int) -> [Range<Int>] {
+        rows[row] ?? []
+    }
+}
+
 /// The view state one frame reads, captured as a value on the main thread.
 ///
 /// Preparing a frame — refreshing the snapshot under the terminal lock and
@@ -508,6 +537,8 @@ struct FrameViewState: Sendable {
     let linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     let linkHighlightMode: LinkHighlightMode
     let commandActive: Bool
+    /// Captured only while Command is held — the only time links are revealed.
+    let linkRevealColors: LinkRevealColors?
     let textBlinkVisible: Bool
     let notifyUpdateChanges: Bool
 
@@ -543,6 +574,16 @@ struct FrameViewState: Sendable {
         linkHighlightRange = view.linkHighlightRange
         linkHighlightMode = view.linkHighlightMode
         commandActive = view.commandActive
+#if os(macOS)
+        if view.commandActive, let style = view.linkRevealStyle {
+            linkRevealColors = LinkRevealColors(background: FrameColor(style.background, view: view),
+                                                foreground: FrameColor(style.foreground, view: view))
+        } else {
+            linkRevealColors = nil
+        }
+#else
+        linkRevealColors = nil
+#endif
         textBlinkVisible = view.textBlinkVisible
         notifyUpdateChanges = view.notifyUpdateChanges
 
@@ -631,6 +672,7 @@ struct SnapshotRenderContext {
     let linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     let linkHighlightMode: LinkHighlightMode
     let commandActive: Bool
+    let linkReveal: SnapshotLinkRevealResolver?
     let customBlockGlyphs: Bool
     let useBrightColors: Bool
     let bidiHostPolicy: BidiHostPolicy
@@ -689,6 +731,7 @@ struct SnapshotRenderContext {
         linkHighlightRange = style.linkHighlightRange
         linkHighlightMode = style.linkHighlightMode
         commandActive = style.commandActive
+        linkReveal = style.linkReveal.map(SnapshotLinkRevealResolver.init)
         customBlockGlyphs = viewState.customBlockGlyphs
         useBrightColors = viewState.useBrightColors
         bidiHostPolicy = viewState.bidiHostPolicy
@@ -2632,6 +2675,7 @@ extension TerminalView {
             linkHighlightRange: linkHighlightRange,
             linkHighlightMode: linkHighlightMode,
             commandActive: commandActive,
+            linkReveal: nil,
             textBlinkVisible: textBlinkVisible)
         let context = SnapshotRenderContext(viewState: FrameViewState(view: self),
                                             style: liveStyle,

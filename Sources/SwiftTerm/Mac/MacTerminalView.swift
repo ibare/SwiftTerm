@@ -76,6 +76,22 @@ private final class OverlayScrollerIndicator: NSView {
     }
 }
 
+/// Colors used to reveal every visible link while the Command key is held.
+///
+/// Set ``TerminalView/linkRevealStyle`` to enable it. Revealed cells are painted
+/// like a selection (a background behind the cell and a replaced foreground), so
+/// both the Core Graphics and Metal renderers show them. Link activation is not
+/// affected: clicking still follows ``TerminalView/linkHighlightMode``.
+public struct LinkRevealStyle {
+    public var background: NSColor
+    public var foreground: NSColor
+
+    public init(background: NSColor, foreground: NSColor) {
+        self.background = background
+        self.foreground = foreground
+    }
+}
+
 /**
  * TerminalView provides an AppKit front-end to the `Terminal` termininal emulator.
  * It is up to a subclass to either wire the terminal emulator to a remote terminal
@@ -1557,6 +1573,24 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
 
+    /// When set, holding Command paints every visible link (implicit and OSC 8)
+    /// with these colors, so the user can see what a Command-click would follow.
+    /// Activation is unchanged and still follows ``linkHighlightMode``.
+    public var linkRevealStyle: LinkRevealStyle? {
+        didSet {
+            if commandActive {
+                redrawForLinkReveal()
+            }
+        }
+    }
+
+    /// Repaints every visible row so revealed links appear or disappear.
+    func redrawForLinkReveal()
+    {
+        withTerminal { $0.updateFullScreen() }
+        frameDriver.markDirty()
+    }
+
     /**
      * If set to true, this will call the TerminalViewDelegate's rangeChanged method
      * when there are changes that are being performed on the UI
@@ -1922,9 +1956,8 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 invalidateLinkHighlight(oldRange: oldRange, newRange: nil)
                 frameDriver.markDirty()
             }
-            if linkHighlightMode == .alwaysWithModifier {
-                withTerminal { $0.updateFullScreen() }
-                frameDriver.markDirty()
+            if linkHighlightMode == .alwaysWithModifier || linkRevealStyle != nil {
+                redrawForLinkReveal()
             }
         }
     }
@@ -1949,9 +1982,8 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             } else if let payload = getPayload(for: event) as? String {
                 previewUrl (payload: payload)
             }
-            if linkHighlightMode == .alwaysWithModifier {
-                withTerminal { $0.updateFullScreen() }
-                frameDriver.markDirty()
+            if linkHighlightMode == .alwaysWithModifier || linkRevealStyle != nil {
+                redrawForLinkReveal()
             }
         } else {
             turnOffUrlPreview ()

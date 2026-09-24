@@ -37,6 +37,8 @@ struct SnapshotStyle {
     var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     var linkHighlightMode: LinkHighlightMode
     var commandActive: Bool
+    /// Every visible link while Command is held, when the view asks for it.
+    var linkReveal: SnapshotLinkReveal?
     var textBlinkVisible: Bool
 
     static let empty = SnapshotStyle(selectionActive: false,
@@ -45,6 +47,7 @@ struct SnapshotStyle {
                                      linkHighlightRange: nil,
                                      linkHighlightMode: .hover,
                                      commandActive: false,
+                                     linkReveal: nil,
                                      textBlinkVisible: true)
 
     func hasSameValue (as other: SnapshotStyle) -> Bool {
@@ -52,7 +55,8 @@ struct SnapshotStyle {
             selectionStart == other.selectionStart && selectionEnd == other.selectionEnd &&
             linkHighlightRange == other.linkHighlightRange &&
             linkHighlightMode.tag == other.linkHighlightMode.tag &&
-            commandActive == other.commandActive && textBlinkVisible == other.textBlinkVisible
+            commandActive == other.commandActive && linkReveal == other.linkReveal &&
+            textBlinkVisible == other.textBlinkVisible
     }
 }
 
@@ -364,6 +368,17 @@ final class TerminalSnapshot {
             cellArenaSnapshot = sourceArena.snapshotCopy()
         }
         let snapshotArena = cellArenaSnapshot!
+        // Revealed links are found here, under the terminal lock and off the main
+        // thread, and only while Command is held — the regex runs over the visible
+        // line groups once per refreshed frame.
+        var linkReveal: SnapshotLinkReveal?
+#if !SWIFTTERM_EMBEDDED
+        if let colors = viewState.linkRevealColors {
+            let visible = max(0, min(buffer.rows, buffer.lines.count - buffer.yDisp))
+            let ranges = terminal.implicitLinkRanges(inRows: buffer.yDisp..<(buffer.yDisp + visible))
+            linkReveal = SnapshotLinkReveal(colors: colors, ranges: ranges)
+        }
+#endif
         let newStyle = SnapshotStyle(
             selectionActive: selection.active,
             selectionStart: selection.start,
@@ -371,6 +386,7 @@ final class TerminalSnapshot {
             linkHighlightRange: viewState.linkHighlightRange,
             linkHighlightMode: viewState.linkHighlightMode,
             commandActive: viewState.commandActive,
+            linkReveal: linkReveal,
             textBlinkVisible: viewState.textBlinkVisible)
         let styleChanged = previousStyle?.hasSameValue(as: newStyle) != true ||
             previousAnsiColors != terminal.ansiColors
