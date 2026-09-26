@@ -1584,6 +1584,25 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
+    /// Replaces the built-in implicit link detection. See ``Terminal/implicitLinkDetector``
+    /// for when and where it is called.
+    public var implicitLinkDetector: Terminal.ImplicitLinkDetector? {
+        get { withTerminal { $0.implicitLinkDetector } }
+        set {
+            withTerminal { $0.implicitLinkDetector = newValue }
+            invalidateImplicitLinks()
+        }
+    }
+
+    /// Call when what the ``implicitLinkDetector`` bases its answer on has changed, so
+    /// revealed links are found again.
+    public func invalidateImplicitLinks()
+    {
+        if commandActive {
+            redrawForLinkReveal()
+        }
+    }
+
     /// Repaints every visible row so revealed links appear or disappear.
     func redrawForLinkReveal()
     {

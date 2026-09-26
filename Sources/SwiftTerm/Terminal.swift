@@ -8895,6 +8895,22 @@ open class Terminal {
         case explicitAndImplicit
     }
 
+    /// Finds implicit links in the text of one wrapped line group.
+    ///
+    /// Returns the ranges of `text` that are links, in any order. Ranges that are empty
+    /// or fall outside `text` are ignored.
+    public typealias ImplicitLinkDetector = @Sendable (_ text: String) -> [Range<String.Index>]
+
+    /// Replaces the built-in implicit link detection (the Ghostty-style URL and path
+    /// pattern) for both the lookup under the pointer and the scan that reveals every
+    /// visible link. `nil`, the default, uses the built-in pattern.
+    ///
+    /// The detector is called with the terminal lock held, possibly off the main thread,
+    /// and once per refreshed frame while links are revealed, so it must be fast and
+    /// thread-safe. Hosts that know more than the text -- which paths exist, for
+    /// example -- can use it to decide where a link ends.
+    public var implicitLinkDetector: ImplicitLinkDetector?
+
     struct LinkMatch: Sendable {
         struct RowRange: Hashable, Sendable {
             let row: Int
@@ -9076,26 +9092,8 @@ open class Terminal {
         guard let lineMap = buildGhosttyImplicitLineMap(at: position, in: buffer) else {
             return nil
         }
-        guard let regex = Self.ghosttyImplicitLinkRegex else {
-            return nil
-        }
 
-        let searchRange = NSRange(lineMap.text.startIndex..<lineMap.text.endIndex, in: lineMap.text)
-        let matches = regex.matches(in: lineMap.text, options: [], range: searchRange)
-        for match in matches {
-            guard match.range.length > 0,
-                  let rawRange = Range(match.range, in: lineMap.text)
-            else {
-                continue
-            }
-            if suppressGhosttyLikeMatch(rawRange, in: lineMap.text) {
-                continue
-            }
-            let textRange = trimmingAttachedTrailingNonASCII(rawRange, in: lineMap.text)
-            guard !textRange.isEmpty else {
-                continue
-            }
-
+        for textRange in implicitLinkTextRanges(in: lineMap.text) {
             let startOffset = lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.lowerBound)
             let endOffset = lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.upperBound)
             guard startOffset < lineMap.cells.count else {
@@ -9648,9 +9646,6 @@ open class Terminal {
     func implicitLinkRanges(inRows rows: Range<Int>) -> [LinkMatch.RowRange]
     {
         let buffer = displayBuffer
-        guard let regex = Self.ghosttyImplicitLinkRegex else {
-            return []
-        }
         let lower = max(0, rows.lowerBound)
         let upper = min(rows.upperBound, buffer.lines.count)
         var result: [LinkMatch.RowRange] = []
@@ -9662,15 +9657,7 @@ open class Terminal {
                 row += 1
                 continue
             }
-            let searchRange = NSRange(lineMap.text.startIndex..<lineMap.text.endIndex, in: lineMap.text)
-            for match in regex.matches(in: lineMap.text, options: [], range: searchRange) {
-                guard match.range.length > 0,
-                      let rawRange = Range(match.range, in: lineMap.text),
-                      !suppressGhosttyLikeMatch(rawRange, in: lineMap.text)
-                else {
-                    continue
-                }
-                let textRange = trimmingAttachedTrailingNonASCII(rawRange, in: lineMap.text)
+            for textRange in implicitLinkTextRanges(in: lineMap.text) {
                 let startOffset = lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.lowerBound)
                 let endOffset = min(lineMap.text.distance(from: lineMap.text.startIndex, to: textRange.upperBound),
                                     lineMap.cells.count)
@@ -9698,6 +9685,31 @@ open class Terminal {
             row = max(row + 1, lastRow + 1)
         }
         return result
+    }
+
+    /// Ranges of the implicit links in `text`: the host's ``implicitLinkDetector`` when
+    /// set, otherwise the built-in pattern. Only non-empty ranges inside `text` are returned.
+    func implicitLinkTextRanges(in text: String) -> [Range<String.Index>]
+    {
+        if let detector = implicitLinkDetector {
+            return detector(text).filter { range in
+                !range.isEmpty && range.lowerBound >= text.startIndex && range.upperBound <= text.endIndex
+            }
+        }
+        guard let regex = Self.ghosttyImplicitLinkRegex else {
+            return []
+        }
+        let searchRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, options: [], range: searchRange).compactMap { match in
+            guard match.range.length > 0,
+                  let rawRange = Range(match.range, in: text),
+                  !suppressGhosttyLikeMatch(rawRange, in: text)
+            else {
+                return nil
+            }
+            let textRange = trimmingAttachedTrailingNonASCII(rawRange, in: text)
+            return textRange.isEmpty ? nil : textRange
+        }
     }
 
     private func suppressGhosttyLikeMatch(_ range: Range<String.Index>, in text: String) -> Bool
