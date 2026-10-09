@@ -3234,7 +3234,19 @@ extension TerminalView {
         // store only on a full-view redraw, so a partial repaint (a restricted DECSTBM
         // scroll region, line insert/delete) otherwise keeps stale glyphs/backgrounds.
         // Clear to transparent — not fill — so a translucent background is preserved.
-        context.clear(dirtyRect)
+        //
+        // An opaque background is painted instead. On screen that is the same
+        // color over the same color, but a bitmap rendering (cacheDisplay, as a
+        // host does to snapshot its window) has no layer behind it: a cleared
+        // cell stays a hole and whatever the host drew underneath shows through.
+        // The context does not say which of the two it is - isDrawingToScreen
+        // is true in both - so the background decides.
+        if let background = layer?.backgroundColor, background.alpha >= 1.0 {
+            context.setFillColor(background)
+            context.fill(dirtyRect)
+        } else {
+            context.clear(dirtyRect)
+        }
         #endif
 
         for row in firstRow...lastRow {
