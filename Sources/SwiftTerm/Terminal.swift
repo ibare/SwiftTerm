@@ -426,7 +426,7 @@ open class Terminal {
         set { _options = newValue }
     }
     private var _options: TerminalOptions
-    private let defaultCursorStyle: CursorStyle
+    let defaultCursorStyle: CursorStyle
     
     // Selection services attached to this terminal.  The views own them; a
     // `SelectionService` owns its terminal, so this side must not retain, or the
@@ -612,14 +612,14 @@ open class Terminal {
     /// Whether DEC reverse-screen mode (DECSCNM) is active.
     private(set) var reverseColors: Bool = false
 
-    private struct KeyboardModeState: Sendable {
+    struct KeyboardModeState: Sendable {
         var flags: KittyKeyboardFlags = []
         var stack: [KittyKeyboardFlags] = []
     }
 
     private static let keyboardModeStackLimit = 16
-    private var keyboardModeNormal = KeyboardModeState()
-    private var keyboardModeAlt = KeyboardModeState()
+    private(set) var keyboardModeNormal = KeyboardModeState()
+    private(set) var keyboardModeAlt = KeyboardModeState()
 
     public var keyboardEnhancementFlags: KittyKeyboardFlags {
         let mode = isCurrentBufferAlternate ? keyboardModeAlt : keyboardModeNormal
@@ -698,7 +698,7 @@ open class Terminal {
     public private(set) var colorScheme: TerminalColorScheme = .dark
     
     private var charset: [UInt8:String]? = nil
-    private var gCharsets: [[UInt8:String]?] = [CharSets.defaultCharset, nil, nil, nil]
+    private(set) var gCharsets: [[UInt8:String]?] = [CharSets.defaultCharset, nil, nil, nil]
     var gcharset: Int = 0
     var reverseWraparound: Bool = false
 #if SWIFTTERM_EMBEDDED
@@ -883,7 +883,7 @@ open class Terminal {
     }
     
     // The protocol encoding for the terminal
-    private var mouseProtocol: MouseProtocolEncoding = .x10
+    private(set) var mouseProtocol: MouseProtocolEncoding = .x10
 
     // This is used to track if we are setting the colors, to prevent a
     // recursive invocation (nativeForegroundColor sets the terminal
@@ -3543,6 +3543,16 @@ open class Terminal {
     }
 
     private var activeHyperlink: ActiveHyperlink? = nil
+
+    /// The OSC 8 payload that the next printed cell receives, used to
+    /// serialize the terminal state.
+    var activeHyperlinkPayload: String? {
+        switch activeHyperlink {
+        case .pending(let payload)?: payload
+        case .resolved(let atom)?: atom.target as? String
+        case .unavailable?, nil: nil
+        }
+    }
     private var payloadCodes = Set<UInt16>()
 
     private func resolveActiveHyperlink() -> TinyAtom? {
