@@ -37,8 +37,9 @@ struct SnapshotStyle {
     var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     var linkHighlightMode: LinkHighlightMode
     var commandActive: Bool
-    /// Every visible link while Command is held, when the view asks for it.
-    var linkReveal: SnapshotLinkReveal?
+    /// The view reveals links while Command is held, in place of the hover
+    /// underline. The reveal itself is drawn over the text, not through it.
+    var linkRevealEnabled: Bool
     var textBlinkVisible: Bool
 
     static let empty = SnapshotStyle(selectionActive: false,
@@ -47,7 +48,7 @@ struct SnapshotStyle {
                                      linkHighlightRange: nil,
                                      linkHighlightMode: .hover,
                                      commandActive: false,
-                                     linkReveal: nil,
+                                     linkRevealEnabled: false,
                                      textBlinkVisible: true)
 
     func hasSameValue (as other: SnapshotStyle) -> Bool {
@@ -55,7 +56,7 @@ struct SnapshotStyle {
             selectionStart == other.selectionStart && selectionEnd == other.selectionEnd &&
             linkHighlightRange == other.linkHighlightRange &&
             linkHighlightMode.tag == other.linkHighlightMode.tag &&
-            commandActive == other.commandActive && linkReveal == other.linkReveal &&
+            commandActive == other.commandActive && linkRevealEnabled == other.linkRevealEnabled &&
             textBlinkVisible == other.textBlinkVisible
     }
 }
@@ -318,6 +319,16 @@ final class TerminalSnapshot {
     /// True when view-dependent appearance changed without a cell-content
     /// change. Core Graphics uses this to invalidate the visible surface.
     private(set) var appearanceChanged = false
+    /// The links revealed while Command is held, and how they are drawn this
+    /// frame. Nil while none is shown.
+    private(set) var linkReveal: SnapshotLinkReveal?
+    /// The buffer rows whose revealed-link decoration changed in the last
+    /// refresh, before and after, for Core Graphics to repaint. Nil when none did.
+    private(set) var linkRevealChangedRows: ClosedRange<Int>?
+    /// What the visible links were found from, to find them again only when
+    /// that changes: the frame moves the reveal every display tick while it
+    /// eases, but the links stay put.
+    private var linkScanKey: LinkScanKey?
     /// The context that goes with this snapshot's contents, built by `refresh`
     /// from the view state it was handed. Nil until the first refresh.
     private(set) var renderContext: SnapshotRenderContext?
@@ -368,17 +379,7 @@ final class TerminalSnapshot {
             cellArenaSnapshot = sourceArena.snapshotCopy()
         }
         let snapshotArena = cellArenaSnapshot!
-        // Revealed links are found here, under the terminal lock and off the main
-        // thread, and only while Command is held — the regex runs over the visible
-        // line groups once per refreshed frame.
-        var linkReveal: SnapshotLinkReveal?
-#if !SWIFTTERM_EMBEDDED
-        if let colors = viewState.linkRevealColors {
-            let visible = max(0, min(buffer.rows, buffer.lines.count - buffer.yDisp))
-            let ranges = terminal.implicitLinkRanges(inRows: buffer.yDisp..<(buffer.yDisp + visible))
-            linkReveal = SnapshotLinkReveal(colors: colors, ranges: ranges)
-        }
-#endif
+        refreshLinkReveal(terminal: terminal, buffer: buffer, frame: viewState.linkReveal)
         let newStyle = SnapshotStyle(
             selectionActive: selection.active,
             selectionStart: selection.start,
@@ -386,7 +387,7 @@ final class TerminalSnapshot {
             linkHighlightRange: viewState.linkHighlightRange,
             linkHighlightMode: viewState.linkHighlightMode,
             commandActive: viewState.commandActive,
-            linkReveal: linkReveal,
+            linkRevealEnabled: viewState.linkRevealEnabled,
             textBlinkVisible: viewState.textBlinkVisible)
         let styleChanged = previousStyle?.hasSameValue(as: newStyle) != true ||
             previousAnsiColors != terminal.ansiColors
@@ -573,6 +574,68 @@ final class TerminalSnapshot {
         previousBidiHostPolicy = viewState.bidiHostPolicy
         previousBidiFont = bidiFont
         return .refreshed
+    }
+
+    /// What the visible links are found from.
+    private struct LinkScanKey: Equatable {
+        let buffer: ObjectIdentifier
+        let yDisp: Int
+        let rows: Int
+        let cols: Int
+        let linesTrimmed: Int
+    }
+
+    /// Finds the visible links while they are revealed, and notes which rows
+    /// need repainting.
+    ///
+    /// Runs under the terminal lock, off the main thread. The links are found
+    /// again only when the screen's contents or position changed: while the
+    /// reveal eases, every display tick refreshes the snapshot, and running the
+    /// link pattern over every visible line group each time would be waste.
+    private func refreshLinkReveal(terminal: Terminal, buffer: Buffer, frame: LinkRevealFrame?) {
+        terminal.terminalLock.preconditionLocked()
+        let previous = linkReveal
+        guard let frame else {
+            linkReveal = nil
+            linkScanKey = nil
+            linkRevealChangedRows = Self.rowSpan(previous?.links ?? [])
+            return
+        }
+        let key = LinkScanKey(buffer: ObjectIdentifier(buffer), yDisp: buffer.yDisp, rows: buffer.rows,
+                              cols: buffer.cols, linesTrimmed: buffer.totalLinesTrimmed)
+        let links: [[Terminal.LinkMatch.RowRange]]
+        if let previous, key == linkScanKey, terminal.getUpdateRange() == nil {
+            links = previous.links
+        } else {
+            let visible = max(0, min(buffer.rows, buffer.lines.count - buffer.yDisp))
+            let rows = buffer.yDisp..<(buffer.yDisp + visible)
+            let explicit = terminal.explicitLinks(inRows: rows)
+            // A hyperlink whose text also reads as a link is drawn once, as the
+            // hyperlink it is.
+            var explicitColumns: [Int: [Range<Int>]] = [:]
+            for range in explicit.joined() {
+                explicitColumns[range.row, default: []].append(range.range)
+            }
+            let implicit = terminal.implicitLinks(inRows: rows).filter { link in
+                !link.contains { range in
+                    explicitColumns[range.row]?.contains { $0.overlaps(range.range) } == true
+                }
+            }
+            links = explicit + implicit
+            linkScanKey = key
+        }
+        let reveal = SnapshotLinkReveal(links: links, frame: frame)
+        linkReveal = reveal
+        linkRevealChangedRows = reveal == previous
+            ? nil
+            : Self.rowSpan(links + (previous?.links ?? []))
+    }
+
+    /// The rows `links` cover, top to bottom.
+    private static func rowSpan(_ links: [[Terminal.LinkMatch.RowRange]]) -> ClosedRange<Int>? {
+        let rows = links.joined().map(\.row)
+        guard let first = rows.min(), let last = rows.max() else { return nil }
+        return first...last
     }
 }
 #endif

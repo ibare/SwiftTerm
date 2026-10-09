@@ -76,20 +76,46 @@ private final class OverlayScrollerIndicator: NSView {
     }
 }
 
-/// Colors used to reveal every visible link while the Command key is held.
+/// How the view reveals every visible link while the Command key is held.
 ///
-/// Set ``TerminalView/linkRevealStyle`` to enable it. Revealed cells are painted
-/// like a selection (a background behind the cell and a replaced foreground), so
-/// both the Core Graphics and Metal renderers show them. Link activation is not
-/// affected: clicking still follows ``TerminalView/linkHighlightMode``.
+/// Set ``TerminalView/linkRevealStyle`` to enable it.
+///
+/// Command is mostly half of a shortcut, so pressing it shows nothing at first.
+/// Links appear once Command has been held alone for ``delay``, or at once when
+/// the pointer travels more than ``pointerTravel`` points while it is held.
+/// Another key pressed with Command, as in Command-C or Command-Tab, keeps them
+/// hidden until Command is released.
+///
+/// Every revealed link gets a faint underline in ``color``. Links near the
+/// pointer's row get a stronger underline and a translucent fill behind their
+/// text, fading out over ``reach`` rows, and the link under the pointer gets
+/// the most. The text keeps its colors. Changes ease in and out, and happen at
+/// once under Reduce Motion. Both the Core Graphics and Metal renderers draw
+/// the reveal, on single-width rows.
+///
+/// Link activation is not affected: clicking still follows
+/// ``TerminalView/linkHighlightMode``. The reveal replaces the hover underline
+/// of ``LinkHighlightMode/hoverWithModifier``.
 public struct LinkRevealStyle {
-    public var background: NSColor
-    public var foreground: NSColor
+    /// The color of the underlines and fills.
+    public var color: NSColor
+    /// How long Command must be held alone before links appear, in seconds.
+    public var delay: TimeInterval
+    /// How far the pointer must travel while Command is held, in points, to
+    /// reveal links at once.
+    public var pointerTravel: CGFloat
+    /// How many rows from the pointer a link keeps some emphasis.
+    public var reach: Int
 
-    public init(background: NSColor, foreground: NSColor) {
-        self.background = background
-        self.foreground = foreground
+    public init(color: NSColor, delay: TimeInterval = 0.18, pointerTravel: CGFloat = 6, reach: Int = 6) {
+        self.color = color
+        self.delay = delay
+        self.pointerTravel = pointerTravel
+        self.reach = reach
     }
+
+    /// How long the reveal takes to ease in, out, or follow the pointer.
+    static let transitionDuration: TimeInterval = 0.14
 }
 
 /**
@@ -1033,7 +1059,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         guard uiShutdownState == .active, terminal != nil else { return }
         let focused = hasFocus
         // Releases can be lost when either the responder or the key window changes.
-        if !focused { kittyKeysWithoutReportedPress.removeAll() }
+        if !focused {
+            kittyKeysWithoutReportedPress.removeAll()
+            endLinkReveal()
+        }
         withTerminal { terminal in
             if terminal.reportedFocusState != focused {
                 terminal.setTerminalFocus(focused)
@@ -1571,18 +1600,37 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
-    var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
-
-    /// When set, holding Command paints every visible link (implicit and OSC 8)
-    /// with these colors, so the user can see what a Command-click would follow.
-    /// Activation is unchanged and still follows ``linkHighlightMode``.
-    public var linkRevealStyle: LinkRevealStyle? {
+    var linkHighlightRange: [Terminal.LinkMatch.RowRange]? {
         didSet {
-            if commandActive {
-                redrawForLinkReveal()
-            }
+            guard linkRevealStyle != nil, linkHighlightRange != oldValue else { return }
+            linkRevealMotion.setHoveredLink(linkHighlightRange, at: CACurrentMediaTime())
+            requestLinkRevealFrame()
         }
     }
+
+    /// When set, holding Command reveals every visible link (implicit and OSC 8)
+    /// as ``LinkRevealStyle`` describes, so the user can see what a Command-click
+    /// would follow. Activation is unchanged and still follows ``linkHighlightMode``.
+    public var linkRevealStyle: LinkRevealStyle? {
+        didSet {
+            endLinkReveal()
+            linkRevealIntent = LinkRevealIntent(delay: linkRevealStyle?.delay ?? 0,
+                                                pointerTravel: linkRevealStyle?.pointerTravel ?? 0)
+            if commandActive {
+                linkRevealCommandPressed()
+            }
+            // The hover underline depends on whether the reveal is on.
+            withTerminal { $0.updateFullScreen() }
+            frameDriver.markDirty()
+        }
+    }
+
+    /// When holding Command reveals links (LinkReveal.swift).
+    private(set) var linkRevealIntent = LinkRevealIntent(delay: 0, pointerTravel: 0)
+    /// How far along the reveal is. Sampled by every frame.
+    private(set) var linkRevealMotion = LinkRevealMotion(duration: LinkRevealStyle.transitionDuration)
+    private var linkRevealTimer: Timer?
+    private var linkRevealKeyMonitor: Any?
 
     /// Replaces the built-in implicit link detection. See ``Terminal/implicitLinkDetector``
     /// for when and where it is called.
@@ -1598,16 +1646,125 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// revealed links are found again.
     public func invalidateImplicitLinks()
     {
-        if commandActive {
+        if commandActive || linkRevealIntent.isArmed {
             redrawForLinkReveal()
         }
     }
 
-    /// Repaints every visible row so revealed links appear or disappear.
+    /// Repaints every visible row so links highlighted while Command is held
+    /// appear or disappear, and revealed links are found again.
     func redrawForLinkReveal()
     {
         withTerminal { $0.updateFullScreen() }
         frameDriver.markDirty()
+    }
+
+    /// The reveal for a frame drawn now, or nil while no link is shown.
+    func sampleLinkReveal(at time: TimeInterval) -> LinkRevealFrame? {
+        guard let style = linkRevealStyle else { return nil }
+        return linkRevealMotion.frame(at: time, color: FrameColor(style.color, view: self), reach: style.reach)
+    }
+
+    /// Command went down while the view has the keys.
+    func linkRevealCommandPressed()
+    {
+        guard linkRevealStyle != nil, !linkRevealIntent.isArmed else { return }
+        let pointer = pointerInBounds()
+        linkRevealIntent.commandPressed(at: CACurrentMediaTime(), pointer: pointer)
+        // Movement is only tracked while Command is held, so the pointer's row
+        // is taken from where it rests now.
+        linkRevealMotion.setPointerRow(pointer.map { calculateMouseHit(at: $0).grid.row },
+                                       at: CACurrentMediaTime())
+        // Command-key shortcuts reach the menu, not this view: watch every key
+        // the application gets while Command is held.
+        linkRevealKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.linkRevealKeyPressed()
+            }
+            return event
+        }
+        if let deadline = linkRevealIntent.deadline {
+            let timer = Timer(timeInterval: max(0, deadline - CACurrentMediaTime()), repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.linkRevealIntent.advance(to: CACurrentMediaTime()) else { return }
+                    self.updateLinkReveal()
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            linkRevealTimer = timer
+        }
+        updateLinkReveal()
+    }
+
+    /// Another key went down while Command is held: a shortcut.
+    private func linkRevealKeyPressed()
+    {
+        guard linkRevealIntent.isArmed else { return }
+        linkRevealIntent.keyPressed()
+        linkRevealTimer?.invalidate()
+        linkRevealTimer = nil
+        updateLinkReveal()
+    }
+
+    /// The pointer moved over the view, to `point` on buffer row `row`.
+    func linkRevealPointerMoved(to point: CGPoint, row: Int)
+    {
+        guard linkRevealStyle != nil else { return }
+        if linkRevealIntent.pointerMoved(to: point) {
+            linkRevealTimer?.invalidate()
+            linkRevealTimer = nil
+            updateLinkReveal()
+        }
+        linkRevealMotion.setPointerRow(row, at: CACurrentMediaTime())
+        requestLinkRevealFrame()
+    }
+
+    /// The pointer left the view.
+    func linkRevealPointerExited()
+    {
+        guard linkRevealStyle != nil else { return }
+        linkRevealMotion.setPointerRow(nil, at: CACurrentMediaTime())
+        requestLinkRevealFrame()
+    }
+
+    /// Command went up, or the view stopped receiving keys: hide the links.
+    func endLinkReveal()
+    {
+        linkRevealTimer?.invalidate()
+        linkRevealTimer = nil
+        if let monitor = linkRevealKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            linkRevealKeyMonitor = nil
+        }
+        guard linkRevealIntent.isArmed else { return }
+        linkRevealIntent.commandReleased()
+        updateLinkReveal()
+    }
+
+    /// Eases the links toward what the intent says and asks for frames.
+    private func updateLinkReveal()
+    {
+        linkRevealMotion.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? 0 : LinkRevealStyle.transitionDuration
+        linkRevealMotion.setShown(linkRevealIntent.isShown, at: CACurrentMediaTime())
+        updateLinkHighlightTracking()
+        frameDriver.markDirty()
+    }
+
+    /// Asks for a frame when the reveal could look different in it.
+    private func requestLinkRevealFrame()
+    {
+        if linkRevealIntent.isShown || linkRevealMotion.isAnimating(at: CACurrentMediaTime()) {
+            frameDriver.markDirty()
+        }
+    }
+
+    /// Where the pointer is in view coordinates, when it is over the view.
+    private func pointerInBounds() -> CGPoint?
+    {
+        guard let window else { return nil }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(point) ? point : nil
     }
 
     /**
@@ -1928,7 +2085,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if currentMouseMode == .anyEvent {
             return true
         }
-        if commandActive {
+        if commandActive || linkRevealIntent.isArmed {
             return true
         }
         if linkHighlightMode == .hover {
@@ -1975,7 +2132,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 invalidateLinkHighlight(oldRange: oldRange, newRange: nil)
                 frameDriver.markDirty()
             }
-            if linkHighlightMode == .alwaysWithModifier || linkRevealStyle != nil {
+            if linkHighlightMode == .alwaysWithModifier {
                 redrawForLinkReveal()
             }
         }
@@ -2001,11 +2158,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             } else if let payload = getPayload(for: event) as? String {
                 previewUrl (payload: payload)
             }
-            if linkHighlightMode == .alwaysWithModifier || linkRevealStyle != nil {
+            if linkHighlightMode == .alwaysWithModifier {
                 redrawForLinkReveal()
             }
+            linkRevealCommandPressed()
         } else {
             turnOffUrlPreview ()
+            endLinkReveal()
         }
         let keyboardEnhancementFlags = withTerminal { $0.keyboardEnhancementFlags }
         if keyboardEnhancementFlags.contains(.reportAllKeys),
@@ -2030,7 +2189,24 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         super.flagsChanged(with: event)
     }
     
+    public override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        guard linkRevealStyle != nil else { return }
+        // Leaving the view ends the Command hover (see mouseExited). The reveal
+        // outlives it, so coming back with Command still held picks it up again.
+        if linkRevealIntent.isArmed, !commandActive, event.modifierFlags.contains(.command) {
+            commandActive = true
+            startTracking()
+        }
+        let hit = calculateMouseHit(with: event)
+        linkRevealPointerMoved(to: convert(event.locationInWindow, from: nil), row: hit.grid.row)
+        if commandActive {
+            updateHoverLink(at: hit.grid)
+        }
+    }
+
     public override func mouseExited(with event: NSEvent) {
+        linkRevealPointerExited()
         turnOffUrlPreview()
         if linkHighlightMode == .hover || linkHighlightMode == .hoverWithModifier {
             let oldRange = linkHighlightRange
@@ -4075,6 +4251,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             reportLink(at: hit.grid)
         }
         updateHoverLink(at: hit.grid)
+        linkRevealPointerMoved(to: convert(event.locationInWindow, from: nil), row: hit.grid.row)
         
         if withTerminal({ $0.mouseMode.sendMotionEvent() }) {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)

@@ -493,35 +493,6 @@ struct SnapshotSelectionResolver {
     }
 }
 
-/// ``LinkRevealStyle`` (macOS) captured for one frame.
-struct LinkRevealColors: Sendable, Hashable {
-    let background: FrameColor
-    let foreground: FrameColor
-}
-
-/// Links revealed in one frame: the colors and the visible cell ranges to paint.
-struct SnapshotLinkReveal: Equatable {
-    let colors: LinkRevealColors
-    let ranges: [Terminal.LinkMatch.RowRange]
-}
-
-/// Per-row lookup of the revealed ranges, built once per render context.
-struct SnapshotLinkRevealResolver {
-    let background: TTColor
-    let foreground: TTColor
-    private let rows: [Int: [Range<Int>]]
-
-    init(_ reveal: SnapshotLinkReveal) {
-        background = reveal.colors.background.nativeColor
-        foreground = reveal.colors.foreground.nativeColor
-        rows = Dictionary(grouping: reveal.ranges, by: \.row).mapValues { $0.map(\.range) }
-    }
-
-    func columns(forRow row: Int) -> [Range<Int>] {
-        rows[row] ?? []
-    }
-}
-
 /// The view state one frame reads, captured as a value on the main thread.
 ///
 /// Preparing a frame — refreshing the snapshot under the terminal lock and
@@ -537,8 +508,13 @@ struct FrameViewState: Sendable {
     let linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     let linkHighlightMode: LinkHighlightMode
     let commandActive: Bool
-    /// Captured only while Command is held — the only time links are revealed.
-    let linkRevealColors: LinkRevealColors?
+    /// Whether the view reveals links while Command is held (macOS
+    /// ``LinkRevealStyle``), which replaces the hover underline.
+    let linkRevealEnabled: Bool
+    /// The reveal at this frame; nil while no link is shown.
+    let linkReveal: LinkRevealFrame?
+    /// The reveal is easing, so a later frame will show it differently.
+    let linkRevealAnimating: Bool
     let textBlinkVisible: Bool
     let notifyUpdateChanges: Bool
 
@@ -575,14 +551,14 @@ struct FrameViewState: Sendable {
         linkHighlightMode = view.linkHighlightMode
         commandActive = view.commandActive
 #if os(macOS)
-        if view.commandActive, let style = view.linkRevealStyle {
-            linkRevealColors = LinkRevealColors(background: FrameColor(style.background, view: view),
-                                                foreground: FrameColor(style.foreground, view: view))
-        } else {
-            linkRevealColors = nil
-        }
+        let now = CACurrentMediaTime()
+        linkRevealEnabled = view.linkRevealStyle != nil
+        linkReveal = view.sampleLinkReveal(at: now)
+        linkRevealAnimating = view.linkRevealMotion.isAnimating(at: now)
 #else
-        linkRevealColors = nil
+        linkRevealEnabled = false
+        linkReveal = nil
+        linkRevealAnimating = false
 #endif
         textBlinkVisible = view.textBlinkVisible
         notifyUpdateChanges = view.notifyUpdateChanges
@@ -672,7 +648,9 @@ struct SnapshotRenderContext {
     let linkHighlightRange: [Terminal.LinkMatch.RowRange]?
     let linkHighlightMode: LinkHighlightMode
     let commandActive: Bool
-    let linkReveal: SnapshotLinkRevealResolver?
+    let linkRevealEnabled: Bool
+    /// Fills and underlines for revealed links; nil while none is shown.
+    private(set) var linkRevealPaint: LinkRevealPaint?
     let customBlockGlyphs: Bool
     let useBrightColors: Bool
     let bidiHostPolicy: BidiHostPolicy
@@ -689,6 +667,18 @@ struct SnapshotRenderContext {
         self.init(viewState: viewState, style: snapshot.style,
                   nativeColors: snapshot.nativeColors(for: viewState.appearance),
                   cols: snapshot.cols)
+        if let reveal = snapshot.linkReveal {
+            let selection = self.selection
+            let paint = LinkRevealPaint(
+                reveal: reveal,
+                metrics: LinkRevealPaint.Metrics(cellWidth: cellDimension.width,
+                                                 cellHeight: cellDimension.height,
+                                                 baselineOffset: baselineOffset,
+                                                 underlinePosition: fonts.underlinePosition()),
+                selection: { selection.columns(forRow: $0) },
+                isDecorated: { snapshot.row(atAbsolute: $0)?.line.renderMode == .single })
+            linkRevealPaint = paint.isEmpty ? nil : paint
+        }
     }
 
     init (viewState: FrameViewState, style: SnapshotStyle, ansiColors: [Color],
@@ -731,7 +721,8 @@ struct SnapshotRenderContext {
         linkHighlightRange = style.linkHighlightRange
         linkHighlightMode = style.linkHighlightMode
         commandActive = style.commandActive
-        linkReveal = style.linkReveal.map(SnapshotLinkRevealResolver.init)
+        linkRevealEnabled = style.linkRevealEnabled
+        linkRevealPaint = nil
         customBlockGlyphs = viewState.customBlockGlyphs
         useBrightColors = viewState.useBrightColors
         bidiHostPolicy = viewState.bidiHostPolicy
@@ -2668,6 +2659,7 @@ extension TerminalView {
             }
             column += max(1, Int(cell.width))
         }
+        let viewState = FrameViewState(view: self)
         let liveStyle = SnapshotStyle(
             selectionActive: selection?.active == true,
             selectionStart: selection?.start ?? Position(col: 0, row: 0),
@@ -2675,9 +2667,9 @@ extension TerminalView {
             linkHighlightRange: linkHighlightRange,
             linkHighlightMode: linkHighlightMode,
             commandActive: commandActive,
-            linkReveal: nil,
+            linkRevealEnabled: viewState.linkRevealEnabled,
             textBlinkVisible: textBlinkVisible)
-        let context = SnapshotRenderContext(viewState: FrameViewState(view: self),
+        let context = SnapshotRenderContext(viewState: viewState,
                                             style: liveStyle,
                                             ansiColors: terminal.ansiColors, cols: cols)
         var result = textBuilder.buildAttributedString(row: snapshotRow, absoluteRow: row,
@@ -3085,6 +3077,24 @@ extension TerminalView {
 
     
     // TODO: this should not render any lines outside the dirtyRect
+    /// Draws revealed-link fills or underlines for one row whose bottom edge is
+    /// at `rowMinY`, as rounded rectangles in the reveal color.
+    private func drawLinkRevealMarks(_ marks: [LinkRevealPaint.Mark], color: FrameColor,
+                                     cornerRadius: CGFloat, rowMinY: CGFloat, in context: CGContext) {
+        context.saveGState()
+        context.setShouldAntialias(true)
+        for mark in marks {
+            let rect = mark.rect(rowMinY: rowMinY)
+            guard rect.width > 0, rect.height > 0 else { continue }
+            let radius = min(cornerRadius, rect.width / 2, rect.height / 2)
+            context.setFillColor(CGColor(srgbRed: color.red, green: color.green, blue: color.blue,
+                                         alpha: color.alpha * mark.alpha))
+            context.addPath(CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil))
+            context.fillPath()
+        }
+        context.restoreGState()
+    }
+
     func drawTerminalContents (dirtyRect: TTRect, context: CGContext, bufferOffset: Int)
     {
         // The Core Graphics draw: glyph shaping and painting from the snapshot,
@@ -3446,6 +3456,12 @@ extension TerminalView {
                     layer: .belowText)
             }
 
+            if let paint = renderContext.linkRevealPaint, let fills = paint.fills[row] {
+                drawLinkRevealMarks(fills, color: paint.color,
+                                    cornerRadius: LinkRevealPaint.fillCornerRadius,
+                                    rowMinY: lineOrigin.y, in: context)
+            }
+
             if !lineInfo.boxDrawings.isEmpty {
                 drawBoxDrawings(lineInfo.boxDrawings, lineOrigin: lineOrigin, in: context)
             }
@@ -3596,6 +3612,12 @@ extension TerminalView {
                         drawRunAttributes(runAttributes, glyphPositions: positions, in: context)
                     }
                 }
+            }
+
+            if let paint = renderContext.linkRevealPaint, let underlines = paint.underlines[row] {
+                drawLinkRevealMarks(underlines, color: paint.color,
+                                    cornerRadius: LinkRevealPaint.underlineThickness / 2,
+                                    rowMinY: lineOrigin.y, in: context)
             }
 
             if !lineInfo.kittyPlaceholders.isEmpty {
@@ -3805,6 +3827,10 @@ extension TerminalView {
         let tick = Profiling.begin(.frameTick)
         defer { tick.end() }
         guard let viewState = captureFrameViewState() else { return }
+        if viewState.linkRevealAnimating {
+            // An easing link reveal needs the next frame too.
+            frameDriver.markDirty()
+        }
 #if os(macOS) && canImport(MetalKit)
         if usesRenderLoop {
             publishFrameViewState(viewState)

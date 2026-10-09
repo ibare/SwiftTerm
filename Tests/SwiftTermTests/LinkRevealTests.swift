@@ -1,8 +1,8 @@
 //
 //  LinkRevealTests.swift
 //
-//  Trailing particles on implicit links, and the row scan used to reveal
-//  every visible link while Command is held.
+//  Trailing particles on implicit links, and the scans used to reveal every
+//  visible link while Command is held.
 //
 
 import Foundation
@@ -49,5 +49,36 @@ final class LinkRevealTests: TerminalDelegate {
         let terminal = makeTerminal("docs/a.md\r\nplain\r\ndocs/b.md")
         let ranges = terminal.implicitLinkRanges(inRows: 1..<3)
         #expect(ranges == [.init(row: 2, range: 0..<9)])
+    }
+
+    @Test func testImplicitLinksKeepAWrappedLinkTogether() {
+        // "see docs/a" wraps into "bcdefgh.md": one link over two rows.
+        let terminal = makeTerminal("see docs/abcdefgh.md", cols: 10)
+        #expect(terminal.implicitLinks(inRows: 0..<3) ==
+                [[.init(row: 0, range: 4..<10), .init(row: 1, range: 0..<10)]])
+    }
+
+    @Test func testImplicitLinksAreOneEntryPerLink() {
+        let terminal = makeTerminal("docs/a.md and docs/b.md")
+        #expect(terminal.implicitLinks(inRows: 0..<3) ==
+                [[.init(row: 0, range: 0..<9)], [.init(row: 0, range: 14..<23)]])
+    }
+
+    @Test func testExplicitLinksFollowTheHyperlinkPayload() {
+        let terminal = makeTerminal("a \u{1b}]8;;https://example.com\u{07}site\u{1b}]8;;\u{07} b")
+        #expect(terminal.explicitLinks(inRows: 0..<3) == [[.init(row: 0, range: 2..<6)]])
+    }
+
+    @Test func testExplicitLinksContinueAcrossAWrap() {
+        let terminal = makeTerminal("\u{1b}]8;;https://example.com\u{07}0123456789abc\u{1b}]8;;\u{07}", cols: 10)
+        #expect(terminal.explicitLinks(inRows: 0..<3) ==
+                [[.init(row: 0, range: 0..<10), .init(row: 1, range: 0..<3)]])
+    }
+
+    @Test func testDifferentHyperlinksSideBySideStaySeparate() {
+        let terminal = makeTerminal(
+            "\u{1b}]8;;https://a.example\u{07}aa\u{1b}]8;;https://b.example\u{07}bb\u{1b}]8;;\u{07}")
+        #expect(terminal.explicitLinks(inRows: 0..<3) ==
+                [[.init(row: 0, range: 0..<2)], [.init(row: 0, range: 2..<4)]])
     }
 }

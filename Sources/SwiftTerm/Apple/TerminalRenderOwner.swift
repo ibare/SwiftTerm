@@ -459,6 +459,26 @@ final class TerminalRenderOwner: Sendable {
         return prepared.mainEffects
     }
 
+    /// The part of the view whose revealed-link decoration changed in the last
+    /// refresh: the full width of the rows involved.
+    private static func linkRevealRegion(_ snapshot: TerminalSnapshot,
+                                         viewState: FrameViewState) -> CGRect? {
+        guard let rows = snapshot.linkRevealChangedRows else { return nil }
+        let top = max(0, rows.lowerBound - snapshot.yDisp)
+        let bottom = min(snapshot.rowCount - 1, rows.upperBound - snapshot.yDisp)
+        guard top <= bottom else { return nil }
+        let cellHeight = viewState.cellDimension.height
+        return CGRect(x: 0,
+                      y: viewState.viewFrameHeight - cellHeight * CGFloat(bottom + 1),
+                      width: viewState.viewBounds.width,
+                      height: cellHeight * CGFloat(bottom - top + 1))
+    }
+
+    private static func unionRegion(_ region: CGRect, _ other: CGRect?) -> CGRect {
+        guard let other else { return region }
+        return region.union(other)
+    }
+
     @MainActor
     func prepareFrame (viewState: FrameViewState) -> TerminalView.PreparedFrame? {
         guard let request = mailbox.takeRequest(viewState: viewState) else { return nil }
@@ -568,10 +588,12 @@ final class TerminalRenderOwner: Sendable {
 #else
                 region = request.viewState.viewBounds
 #endif
-                session.snapshot.cgRegion = region
+                let repainted = Self.unionRegion(region, Self.linkRevealRegion(
+                    session.snapshot, viewState: request.viewState))
+                session.snapshot.cgRegion = repainted
                 session.snapshot.rangeChanged = changed
                 result = TerminalView.PreparedFrame(
-                    region: region,
+                    region: repainted,
                     rangeChanged: changed,
                     notifyAccessibility: request.notifyAccessibility,
                     needsMetalDisplay: metalActive,
@@ -594,10 +616,13 @@ final class TerminalRenderOwner: Sendable {
                 let changed = request.viewState.notifyUpdateChanges
                     ? (start: buffer.yDisp + buffer.y, end: buffer.yDisp + buffer.y)
                     : nil
-                session.snapshot.cgRegion = nil
+                // Only the revealed links may have moved on: an easing reveal
+                // repaints their rows and nothing else.
+                let region = Self.linkRevealRegion(session.snapshot, viewState: request.viewState)
+                session.snapshot.cgRegion = region
                 session.snapshot.rangeChanged = changed
                 result = TerminalView.PreparedFrame(
-                    region: nil,
+                    region: region,
                     rangeChanged: changed,
                     notifyAccessibility: false,
                     needsMetalDisplay: metalActive,

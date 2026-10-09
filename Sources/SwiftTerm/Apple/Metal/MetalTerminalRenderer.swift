@@ -409,6 +409,11 @@ struct DrawData {
     var cursorColorVertices: [ColorVertex]
     var cursorGlyphVerticesGray: [GlyphVertex]
     var cursorGlyphVerticesColor: [GlyphVertex]
+    /// Revealed-link fills, drawn between the cell backgrounds and the glyphs.
+    /// Built per frame: they ease while the row contents stay cached.
+    var linkRevealFillVertices: [ColorVertex] = []
+    /// Revealed-link underlines, drawn over the glyphs.
+    var linkRevealUnderlineVertices: [ColorVertex] = []
 }
 
 struct KittyImageSignature: Hashable {
@@ -1244,7 +1249,7 @@ final class MetalTerminalRenderer {
         let viewport = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
 
         if let frame = drawData.frame {
-            drawFrameData(frame, encoder: encoder, viewport: viewport)
+            drawFrameData(frame, drawData: drawData, encoder: encoder, viewport: viewport)
         } else {
             let rows = drawData.rows
             drawImageRows(rows: rows,
@@ -1273,6 +1278,8 @@ final class MetalTerminalRenderer {
                               encoder: encoder,
                               viewport: viewport)
 
+            drawColorVertices(drawData.linkRevealFillVertices, encoder: encoder, viewport: viewport)
+
             drawVertexBuffers(rows: rows,
                               bufferKey: \.glyphGrayBuffer,
                               countKey: \.glyphGrayCount,
@@ -1296,6 +1303,8 @@ final class MetalTerminalRenderer {
                               texture: nil,
                               encoder: encoder,
                               viewport: viewport)
+
+            drawColorVertices(drawData.linkRevealUnderlineVertices, encoder: encoder, viewport: viewport)
 
             drawImageRows(rows: rows,
                           imageKey: \.placeholderImageBuffers,
@@ -1632,11 +1641,92 @@ final class MetalTerminalRenderer {
                                              firstRow: firstRow,
                                              lastRow: lastRow)
 
+        let linkReveal = buildLinkRevealVertices(context: context,
+                                                 scale: scale,
+                                                 cellHeight: cellHeight,
+                                                 yDisp: visibleDisp,
+                                                 rows: firstRow...lastRow)
+
         return DrawData(rows: rows,
                         frame: frameData,
                         cursorColorVertices: cursorData.colorVertices,
                         cursorGlyphVerticesGray: cursorData.glyphVerticesGray,
-                        cursorGlyphVerticesColor: cursorData.glyphVerticesColor)
+                        cursorGlyphVerticesColor: cursorData.glyphVerticesColor,
+                        linkRevealFillVertices: linkReveal.fills,
+                        linkRevealUnderlineVertices: linkReveal.underlines)
+    }
+
+    /// The triangles for the revealed links on the visible rows, in pixels.
+    private func buildLinkRevealVertices(context: SnapshotRenderContext,
+                                         scale: CGFloat,
+                                         cellHeight: CGFloat,
+                                         yDisp: Int,
+                                         rows: ClosedRange<Int>) -> (fills: [ColorVertex], underlines: [ColorVertex]) {
+        guard let paint = context.linkRevealPaint else { return ([], []) }
+        let color = paint.color
+        func vertices(_ marks: [Int: [LinkRevealPaint.Mark]], cornerRadius: CGFloat) -> [ColorVertex] {
+            var result: [ColorVertex] = []
+            for (row, rowMarks) in marks where rows.contains(row) {
+                let rowMinY = context.viewBounds.height - cellHeight * CGFloat(row - yDisp + 1)
+                for mark in rowMarks {
+                    let rect = mark.rect(rowMinY: rowMinY)
+                    let pixels = CGRect(x: rect.minX * scale, y: rect.minY * scale,
+                                        width: rect.width * scale, height: rect.height * scale)
+                    let tint = SIMD4<Float>(Float(color.red), Float(color.green), Float(color.blue),
+                                            Float(color.alpha * mark.alpha))
+                    result.append(contentsOf: roundedRectVertices(pixels, radius: cornerRadius * scale, color: tint))
+                }
+            }
+            return result
+        }
+        return (vertices(paint.fills, cornerRadius: LinkRevealPaint.fillCornerRadius),
+                vertices(paint.underlines, cornerRadius: LinkRevealPaint.underlineThickness / 2))
+    }
+
+    /// Triangles covering `rect` with its corners rounded by `radius`. The
+    /// pieces do not overlap, so a translucent color blends once.
+    private func roundedRectVertices(_ rect: CGRect, radius: CGFloat, color: SIMD4<Float>) -> [ColorVertex] {
+        guard rect.width > 0, rect.height > 0 else { return [] }
+        let r = min(radius, rect.width / 2, rect.height / 2)
+        guard r > 0 else {
+            return quadVertices(x0: rect.minX, y0: rect.minY, x1: rect.maxX, y1: rect.maxY, color: color)
+        }
+        var result = quadVertices(x0: rect.minX + r, y0: rect.minY, x1: rect.maxX - r, y1: rect.maxY, color: color)
+        result += quadVertices(x0: rect.minX, y0: rect.minY + r, x1: rect.minX + r, y1: rect.maxY - r, color: color)
+        result += quadVertices(x0: rect.maxX - r, y0: rect.minY + r, x1: rect.maxX, y1: rect.maxY - r, color: color)
+        let segments = 6
+        let corners: [(center: CGPoint, start: CGFloat)] = [
+            (CGPoint(x: rect.maxX - r, y: rect.maxY - r), 0),
+            (CGPoint(x: rect.minX + r, y: rect.maxY - r), .pi / 2),
+            (CGPoint(x: rect.minX + r, y: rect.minY + r), .pi),
+            (CGPoint(x: rect.maxX - r, y: rect.minY + r), .pi * 3 / 2),
+        ]
+        for corner in corners {
+            let center = SIMD2<Float>(Float(corner.center.x), Float(corner.center.y))
+            for step in 0..<segments {
+                let a0 = corner.start + CGFloat(step) * (.pi / 2) / CGFloat(segments)
+                let a1 = corner.start + CGFloat(step + 1) * (.pi / 2) / CGFloat(segments)
+                result.append(ColorVertex(position: center, color: color))
+                result.append(ColorVertex(position: SIMD2<Float>(Float(corner.center.x + r * cos(a0)),
+                                                                 Float(corner.center.y + r * sin(a0))),
+                                          color: color))
+                result.append(ColorVertex(position: SIMD2<Float>(Float(corner.center.x + r * cos(a1)),
+                                                                 Float(corner.center.y + r * sin(a1))),
+                                          color: color))
+            }
+        }
+        return result
+    }
+
+    private func drawColorVertices(_ vertices: [ColorVertex],
+                                   encoder: MTLRenderCommandEncoder,
+                                   viewport: SIMD2<Float>) {
+        guard !vertices.isEmpty, let buffer = makeBuffer(vertices) else { return }
+        encoder.setRenderPipelineState(colorPipeline)
+        encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+        var viewportVar = viewport
+        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
     }
 
     private func visibleRowRange(snapshot: TerminalSnapshot) -> (Int, Int, Int)? {
@@ -3212,7 +3302,8 @@ final class MetalTerminalRenderer {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cells.count * 6)
     }
 
-    private func drawFrameData(_ frame: FrameDrawData, encoder: MTLRenderCommandEncoder, viewport: SIMD2<Float>) {
+    private func drawFrameData(_ frame: FrameDrawData, drawData: DrawData,
+                               encoder: MTLRenderCommandEncoder, viewport: SIMD2<Float>) {
         drawImageBatches(frame.belowBackgroundImageDraws, encoder: encoder, viewport: viewport)
 
         drawCellBuffer(frame.backgroundCells,
@@ -3228,6 +3319,8 @@ final class MetalTerminalRenderer {
                        texture: nil,
                        encoder: encoder,
                        viewport: viewport)
+
+        drawColorVertices(drawData.linkRevealFillVertices, encoder: encoder, viewport: viewport)
 
         drawCellBuffer(frame.glyphCellsGray,
                        pipeline: cellTextGrayPipeline,
@@ -3246,6 +3339,8 @@ final class MetalTerminalRenderer {
                        texture: nil,
                        encoder: encoder,
                        viewport: viewport)
+
+        drawColorVertices(drawData.linkRevealUnderlineVertices, encoder: encoder, viewport: viewport)
 
         drawImageBatches(frame.placeholderImageDraws, encoder: encoder, viewport: viewport)
         drawImageBatches(frame.overImageDraws, encoder: encoder, viewport: viewport)

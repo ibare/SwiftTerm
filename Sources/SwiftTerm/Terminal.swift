@@ -9651,15 +9651,25 @@ open class Terminal {
     }
 
     /// Cell ranges of every implicit (regex-detected) link that touches `rows`, in buffer
-    /// coordinates. Used to reveal all links at once; lookups under the pointer use
-    /// ``linkMatch(at:mode:)``. Each wrapped line group is scanned once.
+    /// coordinates, flattened across links. Lookups under the pointer use
+    /// ``linkMatch(at:mode:)``.
     func implicitLinkRanges(inRows rows: Range<Int>) -> [LinkMatch.RowRange]
+    {
+        var seen = Set<LinkMatch.RowRange>()
+        return implicitLinks(inRows: rows).joined().filter { seen.insert($0).inserted }
+    }
+
+    /// Every implicit (regex-detected) link that touches `rows`, one entry per link: its
+    /// cell range on each row it covers inside `rows`, top to bottom, in buffer
+    /// coordinates. A link wrapped over several rows stays one entry. Each wrapped line
+    /// group is scanned once.
+    func implicitLinks(inRows rows: Range<Int>) -> [[LinkMatch.RowRange]]
     {
         let buffer = displayBuffer
         let lower = max(0, rows.lowerBound)
         let upper = min(rows.upperBound, buffer.lines.count)
-        var result: [LinkMatch.RowRange] = []
-        var seen = Set<LinkMatch.RowRange>()
+        var result: [[LinkMatch.RowRange]] = []
+        var seen = Set<[LinkMatch.RowRange]>()
         var row = lower
         while row < upper {
             guard let lineMap = buildGhosttyImplicitLineMap(at: Position(col: 0, row: row), in: buffer,
@@ -9684,15 +9694,60 @@ open class Terminal {
                         bounds[cell.row] = (cell.col, cellEnd)
                     }
                 }
-                for (boundRow, bound) in bounds where boundRow >= lower && boundRow < upper && bound.start < bound.end {
-                    let range = LinkMatch.RowRange(row: boundRow, range: bound.start..<bound.end)
-                    if seen.insert(range).inserted {
-                        result.append(range)
-                    }
+                let link = bounds
+                    .filter { $0.key >= lower && $0.key < upper && $0.value.start < $0.value.end }
+                    .sorted { $0.key < $1.key }
+                    .map { LinkMatch.RowRange(row: $0.key, range: $0.value.start..<$0.value.end) }
+                if !link.isEmpty && seen.insert(link).inserted {
+                    result.append(link)
                 }
             }
             let lastRow = lineMap.cells.last?.row ?? row
             row = max(row + 1, lastRow + 1)
+        }
+        return result
+    }
+
+    /// Every explicit (OSC 8) hyperlink that touches `rows`, one entry per link, in the
+    /// shape ``implicitLinks(inRows:)`` uses: a run of cells carrying the same payload,
+    /// continued onto the next row when the run reaches the last column and the line wraps.
+    func explicitLinks(inRows rows: Range<Int>) -> [[LinkMatch.RowRange]]
+    {
+        let buffer = displayBuffer
+        let lower = max(0, rows.lowerBound)
+        let upper = min(rows.upperBound, buffer.lines.count)
+        var result: [[LinkMatch.RowRange]] = []
+        // The link whose run reached the last column of the previous row.
+        var open: (code: UInt16, index: Int)?
+        for row in lower..<upper {
+            let line = buffer.lines[row]
+            let limit = min(cols, line.count)
+            let carried = line.isWrapped ? open : nil
+            open = nil
+            var col = 0
+            while col < limit {
+                guard let code = payloadCode(at: Position(col: col, row: row), in: buffer) else {
+                    col += 1
+                    continue
+                }
+                var end = col + 1
+                while end < limit && payloadCode(at: Position(col: end, row: row), in: buffer) == code {
+                    end += 1
+                }
+                let range = LinkMatch.RowRange(row: row, range: col..<end)
+                let index: Int
+                if col == 0, let carried, carried.code == code {
+                    index = carried.index
+                    result[index].append(range)
+                } else {
+                    index = result.count
+                    result.append([range])
+                }
+                if end == cols {
+                    open = (code, index)
+                }
+                col = end
+            }
         }
         return result
     }

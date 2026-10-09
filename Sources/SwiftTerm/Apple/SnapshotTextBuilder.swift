@@ -319,7 +319,6 @@ final class SnapshotTextBuilder {
         let line = snapshotRow.line
         let cols = context.cols
         let selectionColumns = context.selection.columns(forRow: absoluteRow)
-        let revealColumns = context.linkReveal?.columns(forRow: absoluteRow) ?? []
         var col = 0
         var builder: TerminalView.ViewLineSegmentBuilder?
 
@@ -344,7 +343,6 @@ final class SnapshotTextBuilder {
         var lastStyleKey: PackedAttributeKey?
         var lastHasUrl = false
         var lastIsSelected = false
-        var lastIsRevealed = false
         var lastBlinkHidden = false
         var lastGlyphFallbackFont: TTFont?
         var lastGlyphFallbackPolicy: TerminalGlyphPlacementPolicy?
@@ -421,9 +419,6 @@ final class SnapshotTextBuilder {
             }
 
             let isSelected = isColumnSelected(selectionColumns, column: col, width: width)
-            // Selection wins over a revealed link: the user is acting on the selection.
-            let isRevealed = !isSelected && context.linkReveal != nil &&
-                (ch.hasPayload || revealColumns.contains { $0.overlaps(col..<(col + width)) })
             let blinkHidden = !context.textBlinkVisible && attr.style.contains(.blink)
 
             let text: String
@@ -455,7 +450,6 @@ final class SnapshotTextBuilder {
             // rebuilt at these boundaries, so unchanged cells append without
             // copying it.
             if styleKey != lastStyleKey || hasUrl != lastHasUrl || isSelected != lastIsSelected
-                || isRevealed != lastIsRevealed
                 || blinkHidden != lastBlinkHidden
                 || glyphFallback?.font !== lastGlyphFallbackFont
                 || glyphFallback?.policy != lastGlyphFallbackPolicy
@@ -464,19 +458,11 @@ final class SnapshotTextBuilder {
                 lastStyleKey = styleKey
                 lastHasUrl = hasUrl
                 lastIsSelected = isSelected
-                lastIsRevealed = isRevealed
                 lastBlinkHidden = blinkHidden
                 lastGlyphFallbackFont = glyphFallback?.font
                 lastGlyphFallbackPolicy = glyphFallback?.policy
-                if isSelected || isRevealed || blinkHidden || needsDirectionOverride || glyphFallback != nil {
+                if isSelected || blinkHidden || needsDirectionOverride || glyphFallback != nil {
                     var batchAttributes = attributes.values
-                    if isRevealed, let reveal = context.linkReveal {
-                        batchAttributes[.selectionBackgroundColor] = reveal.background
-                        batchAttributes[.foregroundColor] = reveal.foreground
-                        if batchAttributes[.underlineColor] != nil {
-                            batchAttributes[.underlineColor] = reveal.foreground
-                        }
-                    }
                     if isSelected {
                         batchAttributes[.selectionBackgroundColor] = context.selectedTextBackgroundColor
                         batchAttributes[.foregroundColor] = context.selectedTextForegroundColor
@@ -650,7 +636,9 @@ final class SnapshotTextBuilder {
             }
             return highlight.range.overlaps(column..<(column + width))
         case .hoverWithModifier:
-            guard context.commandActive,
+            // A view that reveals links marks the one under the pointer itself,
+            // and only once Command is held for a link rather than a shortcut.
+            guard context.commandActive, !context.linkRevealEnabled,
                   let highlight = context.linkHighlightRange?.first(where: { $0.row == row }) else {
                 return false
             }
